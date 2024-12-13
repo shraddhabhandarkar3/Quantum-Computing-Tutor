@@ -11,6 +11,7 @@ python = "3.10.15"
 streamlit = "^1.40.2"
 requests = "^2.32.3"
 python-dotenv = "^1.0.1"
+fpdf = "^1.7.2"
 
 
 [build-system]
