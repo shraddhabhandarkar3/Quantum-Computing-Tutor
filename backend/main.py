@@ -11,6 +11,7 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from unstructured.partition.auto import partition
 from unstructured.staging.base import convert_to_dict
+from unstructured.partition.pdf import partition_pdf
 from semantic_router.encoders import OpenAIEncoder
 from pinecone import Pinecone, ServerlessSpec
 import boto3
@@ -117,8 +118,12 @@ def upload_to_s3(data, filename):
     os.remove(filename)
 
 def extract_content(file_path):
-    elements = partition(filename=file_path)
+    if file_path.lower().endswith('.pdf'):
+        elements = partition_pdf(filename=file_path)
+    else:
+        elements = partition(filename=file_path)
     return convert_to_dict(elements)
+
 
 def generate_embeddings(content, metadata=None):
     embeddings_model = OpenAIEmbeddings()
@@ -201,6 +206,8 @@ def get_relevant_passages(query, top_k=5):
     return [result["metadata"]["text"] for result in results["matches"]]
 
 # API Endpoints
+MAX_FILE_SIZE_MB = 5  # Maximum file size in MB
+
 @app.post("/summarize-pdf/")
 async def summarize_pdf(
     file: Optional[UploadFile] = None,
@@ -209,56 +216,124 @@ async def summarize_pdf(
     chapter: Optional[str] = None
 ):
     try:
-        logger.info(f"Summarize PDF request - document: {document_name}, topic: {topic}, chapter: {chapter}")
         
+        logger.info(f"Summarize PDF request - document: {document_name}, topic: {topic}, chapter: {chapter}")
+
         if file:
-            content = await process_uploaded_document(file)
-            logger.info(f"Processed uploaded file with content length: {len(content)}")
+            try:
+                file_size_mb = len(await file.read()) / (1024 * 1024)  # Calculate file size in MB
+                await file.seek(0)  # Reset the file pointer after reading
+                if file_size_mb > MAX_FILE_SIZE_MB:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"File size exceeds the limit of {MAX_FILE_SIZE_MB} MB. Please upload a smaller file."
+                    )
+        # Save the uploaded file locally
+                file_path = f"temp_{file.filename}"
+                with open(file_path, "wb") as f:
+                    f.write(await file.read())
+
+        # Debug instruction: Verify if the file exists
+                logger.debug(f"File saved at: {file_path}, Exists: {os.path.exists(file_path)}")
+
+        # Extract content
+                content = " ".join([elem.get("text", "") for elem in extract_content(file_path)])
+                logger.info(f"Processed uploaded file with content length: {len(content)} characters.")
+
+        # Remove the temp file after processing
+                os.remove(file_path)
+
+            except Exception as e:
+                logger.error(f"Error processing uploaded file: {e}")
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to process the uploaded file. Please upload a valid file."
+                )
+
+        #if file:
+            # Validate and process uploaded file
+            ##file_size_mb = len(await file.read()) / (1024 * 1024)
+                #await file.seek(0)  # Reset file pointer after size check
+                #if file_size_mb > MAX_FILE_SIZE_MB:
+                 #   raise HTTPException(
+                  #      status_code=400,
+                   #     detail=f"File size exceeds the limit of {MAX_FILE_SIZE_MB} MB. Please upload a smaller file."
+                   # )
+                # Extract content
+   #             content = " ".join([elem.get("text", "") for elem in extract_content(file.filename)])
+    #            logger.info(f"Processed uploaded file with content length: {len(content)} characters.")
+     #       except Exception as e:
+      #          logger.error(f"Error processing uploaded file: {e}")
+       #         raise HTTPException(
+        #            status_code=500,
+         #           detail="Failed to process the uploaded file. Please upload a valid file."
+          #      )
+
         elif document_name:
-            # For stored documents, use Pinecone to fetch relevant content
-            query = chapter if chapter else topic if topic else document_name
-            logger.info(f"Using query: {query} for document: {document_name}")
-            
-            # Create embedding for query
-            embeddings = OpenAIEmbeddings()
-            query_embedding = embeddings.embed_query(query)
-            logger.info("Generated query embedding")
-            
-            # Query Pinecone
-            results = index.query(
-                vector=query_embedding,
-                top_k=3,
-                include_metadata=True,
-                filter={"file_name": document_name}
-            )
-            logger.info(f"Found {len(results['matches'])} matches in Pinecone")
-            
-            if not results["matches"]:
-                raise HTTPException(
-                    status_code=404,
-                    detail="No relevant content found for the specified chapter/topic"
+            # Validate and process stored document
+            try:
+                query = chapter if chapter else topic if topic else document_name
+                logger.info(f"Using query: {query} for document: {document_name}")
+
+                # Create embedding for query
+                embeddings = OpenAIEmbeddings()
+                query_embedding = embeddings.embed_query(query)
+                logger.info("Generated query embedding")
+
+                # Query Pinecone
+                results = index.query(
+                    vector=query_embedding,
+                    top_k=3,
+                    include_metadata=True,
+                    filter={"file_name": document_name}
                 )
-            
-            # Extract content based on chapter or get all content
-            if chapter:
-                content = extract_chapter_content(results["matches"], chapter)
-                logger.info(f"Extracted chapter content length: {len(content)}")
-            else:
-                content = " ".join([res["metadata"]["text"] for res in results["matches"]])
-                logger.info(f"Extracted general content length: {len(content)}")
-            
-            if not content.strip():
+                logger.info(f"Found {len(results['matches'])} matches in Pinecone")
+
+                if not results["matches"]:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="No relevant content found for the specified chapter/topic."
+                    )
+
+                # Extract content based on chapter or get all content
+                if chapter:
+                    content = extract_chapter_content(results["matches"], chapter)
+                    logger.info(f"Extracted chapter content length: {len(content)} characters.")
+                else:
+                    content = " ".join([res["metadata"]["text"] for res in results["matches"]])
+                    logger.info(f"Extracted general content length: {len(content)} characters.")
+
+                if not content.strip():
+                    raise HTTPException(
+                        status_code=404,
+                        detail="No content could be extracted from the document."
+                    )
+            except Exception as e:
+                logger.error(f"Error processing stored document: {e}")
                 raise HTTPException(
-                    status_code=404,
-                    detail="No content could be extracted from the document"
+                    status_code=500,
+                    detail="Failed to process the stored document. Please verify the document name or content."
                 )
+
         else:
-            raise HTTPException(status_code=400, detail="Provide a file or a stored document name.")
+            # No input provided
+            raise HTTPException(
+                status_code=400,
+                detail="No file or document name provided. Please provide input for summarization."
+            )
+
+        # Final content validation
+        if not content or len(content.strip()) == 0:
+            logger.error("Extracted content is empty.")
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to extract content. Ensure the file or document contains valid content."
+            )
 
         # Generate summary
         logger.info("Generating summary...")
         summary = await generate_chapter_summary(content, chapter or topic or "document")
-        logger.info("Summary generated successfully")
+        logger.info("Summary generated successfully.")
 
         return {
             "summary": summary,
@@ -266,10 +341,13 @@ async def summarize_pdf(
             "chapter": chapter,
             "topic": topic
         }
+
     except Exception as e:
         logger.error(f"Error in summarize_pdf: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error summarizing PDF: {str(e)}")
 
+notes_list = []  # Global list to store notes
+    
 @app.post("/summarize-chapter/")
 async def summarize_chapter(request: SummaryRequest):
     try:
@@ -454,39 +532,6 @@ async def fetch_research_papers(model: ResearchPaperModel):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching papers: {e}")
 
-@app.post("/save-note/")
-async def save_note(model: SaveNoteModel):
-    try:
-        note_id = str(int(time.time()))
-        note = {"id": note_id, "title": model.title, "content": model.content}
-        upload_to_s3(note, f"notes/{note_id}.json")
-        return {"message": "Note saved successfully.", "note_id": note_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error saving note: {e}")
-
-@app.get("/get-notes/")
-async def get_notes():
-    try:
-        notes = []
-        response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix="notes/")
-        for obj in response.get("Contents", []):
-            note_file = obj["Key"]
-            local_filename = note_file.split("/")[-1]
-            s3_client.download_file(bucket_name, note_file, local_filename)
-            with open(local_filename, "r") as f:
-                notes.append(json.load(f))
-            os.remove(local_filename)
-        return {"notes": notes}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching notes: {e}")
-
-@app.post("/delete-note/")
-async def delete_note(model: DeleteNoteModel):
-    try:
-        s3_client.delete_object(Bucket=bucket_name, Key=f"notes/{model.note_id}.json")
-        return {"message": "Note deleted successfully."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error deleting note: {e}")
 
 @app.get("/publications/")
 async def get_publications():
@@ -513,92 +558,6 @@ async def get_publications():
         return {"publications": list(documents.values())}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching publications: {str(e)}")
-
-@app.get("/search-notes/")
-async def search_notes(query: str):
-    """
-    Search through stored notes using the provided query.
-    """
-    try:
-        # Get all notes
-        response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix="notes/")
-        matching_notes = []
-        
-        for obj in response.get("Contents", []):
-            note_file = obj["Key"]
-            local_filename = note_file.split("/")[-1]
-            s3_client.download_file(bucket_name, note_file, local_filename)
-            
-            with open(local_filename, "r") as f:
-                note = json.load(f)
-                # Search in both title and content
-                if (query.lower() in note["title"].lower() or 
-                    query.lower() in note["content"].lower()):
-                    matching_notes.append(note)
-            
-            os.remove(local_filename)
-        
-        return {"notes": matching_notes}
-    except Exception as e:
-        logger.error(f"Error searching notes: {e}")
-        raise HTTPException(status_code=500, detail=f"Error searching notes: {str(e)}")
-
-@app.get("/get-notes-metadata/")
-async def get_notes_metadata():
-    """
-    Get metadata about stored notes (count, dates, etc.).
-    """
-    try:
-        response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix="notes/")
-        total_notes = len(response.get("Contents", []))
-        return {"total": total_notes}
-    except Exception as e:
-        logger.error(f"Error getting notes metadata: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Enhance existing save_note endpoint
-@app.post("/save-note/")
-async def save_note(model: SaveNoteModel):
-    try:
-        timestamp = datetime.now().isoformat()
-        note_id = str(int(time.time()))
-        note = {
-            "id": note_id,
-            "title": model.title,
-            "content": model.content,
-            "created_at": timestamp,
-            "updated_at": timestamp
-        }
-        
-        # Save to S3
-        upload_to_s3(note, f"notes/{note_id}.json")
-        
-        # Create embedding for the note content
-        try:
-            note_embedding = get_embedding(f"{model.title} {model.content}")
-            metadata = {
-                "text": f"{model.title}\n{model.content}",
-                "title": model.title,
-                "note_id": note_id,
-                "type": "note"
-            }
-            
-            # Store in Pinecone for semantic search
-            index.upsert(
-                vectors=[(f"note_{note_id}", note_embedding, metadata)]
-            )
-        except Exception as e:
-            logger.warning(f"Failed to create embedding for note: {e}")
-        
-        return {
-            "message": "Note saved successfully.",
-            "note_id": note_id,
-            "created_at": timestamp
-        }
-    except Exception as e:
-        logger.error(f"Error saving note: {e}")
-        raise HTTPException(status_code=500, detail=f"Error saving note: {str(e)}")
-
 
 @app.get("/check-pinecone-index/")
 async def check_index():
